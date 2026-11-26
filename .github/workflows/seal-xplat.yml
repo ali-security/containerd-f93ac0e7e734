@@ -1,0 +1,535 @@
+name: Seal Cross-Platform Build and Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Optional go test -run regex for the unit-test matrix (empty = run everything)'
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  module-zip:
+    name: Build Go module zip
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.11'
+          cache: false
+
+      - name: Restore pristine repo metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -sSL -o /tmp/upstream.tar.gz https://github.com/containerd/containerd/archive/refs/tags/v2.2.1.tar.gz
+          tar -xzf /tmp/upstream.tar.gz -C /tmp
+          rm -rf .github
+          cp -r /tmp/containerd-2.2.1/.github .github
+          cp /tmp/containerd-2.2.1/.gitignore .gitignore
+          test ! -e .github/workflows/seal-xplat.yml && test -e .github/workflows/ci.yml
+
+      - name: Build module zip
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/helper
+          cd /tmp/helper
+          go mod init helper
+          go get golang.org/x/mod@v0.24.0
+          cat > /tmp/helper/create_mod.go <<'EOF'
+          package main
+
+          import (
+              "log"
+              "os"
+
+              "golang.org/x/mod/module"
+              "golang.org/x/mod/zip"
+          )
+
+          func main() {
+              v := module.Version{Path: "github.com/containerd/containerd/v2", Version: "v2.2.1"}
+              f, err := os.Create(os.Args[2])
+              if err != nil {
+                  log.Fatal(err)
+              }
+              defer f.Close()
+              if err := zip.CreateFromDir(f, v, os.Args[1]); err != nil {
+                  log.Fatal(err)
+              }
+          }
+          EOF
+          go run /tmp/helper/create_mod.go "$GITHUB_WORKSPACE" /tmp/v2.2.1.zip
+          ls -l /tmp/v2.2.1.zip
+
+      - name: Upload module zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: /tmp/v2.2.1.zip
+          if-no-files-found: error
+
+  # End-to-end coverage for the CRImportCheckpoint restore path, which unit
+  # tests cannot reach. Mirrors the criu/critools/checkpoint steps of upstream
+  # ci.yml's integration-linux job, which runs on a hosted ubuntu runner just
+  # like this one.
+  checkpoint-restore:
+    name: Checkpoint/Restore via CRI
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    env:
+      TEST_RUNTIME: io.containerd.runc.v2
+      CGROUP_DRIVER: cgroupfs
+      RUNC_FLAVOR: runc
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.11'
+          cache: false
+
+      - name: Install containerd dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y gperf dmsetup strace xfsprogs
+          script/setup/install-seccomp
+          script/setup/install-runc
+          script/setup/install-cni $(grep containernetworking/plugins go.mod | awk '{print $2}')
+          script/setup/install-critools
+
+      - name: Install criu
+        run: |
+          set -euo pipefail
+          sudo add-apt-repository -y ppa:criu/ppa
+          sudo apt-get update
+          sudo apt-get install -y criu
+          criu --version
+
+      - name: Install containerd
+        env:
+          CGO_ENABLED: 1
+        run: |
+          set -euo pipefail
+          make binaries GO_BUILD_FLAGS="-mod=vendor"
+          sudo -E PATH=$PATH make install
+
+      - name: Checkpoint/Restore via CRI
+        run: |
+          set -euo pipefail
+          # The test puts containerd's socket under the checked-out tree, and
+          # containerd appends ".ttrpc" to it. This fork's repo name is long
+          # enough that the resulting path passes the 108-byte unix socket
+          # limit (upstream's own /home/runner/work/containerd/containerd fits),
+          # so run the test through a short symlink to the workspace.
+          sudo ln -sfn "$GITHUB_WORKSPACE" /c
+          # crictl's default 2s RPC timeout is too short for `crictl rm -f`
+          # right after a checkpoint on current runner images (criu 4.3): the
+          # stop deadline expires while the container is still being killed.
+          # Upstream release/2.2 raised this to 30s inside the script itself;
+          # that script is a CVE-patched path, so set the same 30s here through
+          # the crictl config file install-critools wrote, leaving it untouched.
+          echo "timeout: 30" | sudo tee -a /etc/crictl.yaml
+          cat /etc/crictl.yaml
+          cd /c/contrib/checkpoint
+          sudo -E PATH=$PATH ./checkpoint-restore-cri-test.sh
+
+  # containerd's state directories are 0o700 while /run/containerd and the v2
+  # task dir stay 0o711, because userns-remapped containers need the traversal
+  # bit. Nothing else in this workflow runs the daemon under a user namespace,
+  # so this leg -- a copy of upstream ci.yml's tests-cri-in-userns job -- is what
+  # would catch a regression in that split. Unlike upstream's fuzz job it
+  # carries no repository gate, so it runs on this fork unchanged.
+  cri-in-userns:
+    name: CRI-in-UserNS (${{ matrix.cgroup_driver }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        cgroup_driver: [cgroupfs, systemd]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up cgroup v2 delegation
+        run: |
+          sudo mkdir -p /etc/systemd/system/user@.service.d
+          cat <<EOF | sudo tee /etc/systemd/system/user@.service.d/delegate.conf
+          [Service]
+          Delegate=cpu cpuset io memory pids
+          EOF
+          sudo systemctl daemon-reload
+
+      - name: Build cri-in-userns image
+        env:
+          CGROUP_DRIVER: ${{ matrix.cgroup_driver }}
+        run: |
+          set -euo pipefail
+          if [ "$CGROUP_DRIVER" = "systemd" ]; then
+            podman build --target cri-in-userns-systemd -t cri-in-userns-systemd -f ./contrib/Dockerfile.test .
+          else
+            podman build --target cri-in-userns -t cri-in-userns -f ./contrib/Dockerfile.test .
+          fi
+
+      - name: Run cri-in-userns image
+        env:
+          CGROUP_DRIVER: ${{ matrix.cgroup_driver }}
+        # Rootless Podman, as upstream does: the daemon under test runs inside a
+        # user namespace, which is the configuration the 0o700/0o711 permission
+        # split has to keep working.
+        run: |
+          if [ "$CGROUP_DRIVER" = "systemd" ]; then
+            set +e
+            touch ./critest_exit_code.txt
+            podman run --rm --privileged --group-add keep-groups -v ./critest_exit_code.txt:/tmp/critest_exit_code.txt cri-in-userns-systemd
+            exit_code=`cat ./critest_exit_code.txt`
+            echo "exit_code:"$exit_code
+            if [ "$exit_code" -gt 0 ]; then
+              exit 1
+            else
+              exit 0
+            fi
+          else
+            # Same critest command and --ginkgo.skip list as the image's CMD in
+            # contrib/Dockerfile.test, plus --ginkgo.vv so ginkgo names every
+            # skipped spec in the log instead of printing only a skip count.
+            set -o pipefail
+            podman run --rm --privileged cri-in-userns critest "--ginkgo.skip=runtime should prefer new apparmor field|should support apparmor field|should support deprecated apparmor_profile field|should support unsafe sysctls|should support safe sysctls|should allow privilege escalation when false" --ginkgo.vv 2>&1 | tee "$RUNNER_TEMP/critest.log"
+          fi
+
+      - name: Report critest skip reasons
+        if: always()
+        env:
+          CGROUP_DRIVER: ${{ matrix.cgroup_driver }}
+        run: |
+          echo "=== critest skips. ginkgo counts three kinds as Skipped:"
+          echo "===  1. specs matching upstream's --ginkgo.skip list (contrib/Dockerfile.test, reasons below). They cannot"
+          echo "===     pass with containerd inside a rootless user namespace: AppArmor profiles cannot be loaded there"
+          echo "===     (apparmor_parser needs CAP_MAC_ADMIN in the initial user namespace, so installing it would not"
+          echo "===     help), /proc/sys is read-only for sysctls, and with a remapped euid NoNewPrivs=false cannot"
+          echo "===     yield uid 0."
+          echo "===  2. pkg/benchmark specs, which critest runs only when invoked with -benchmark."
+          echo "===  3. specs that skip themselves at runtime with a [SKIPPED] message (listed with that message)."
+          grep -E '^# Skip "' contrib/Dockerfile.test | sort -u
+          if [ "$CGROUP_DRIVER" != "systemd" ] && [ -f "$RUNNER_TEMP/critest.log" ]; then
+            echo "=== Every skipped spec of this run (from --ginkgo.vv):"
+            sed -E 's/\x1b\[[0-9;]*m//g' "$RUNNER_TEMP/critest.log" | awk '
+              { sub(/\r$/, "") }
+              /^-{20,}$/ {
+                if (inb) {
+                  if (rt && rr != "") reason = "skipped at runtime: " rr
+                  else if (spec ~ /benchmark/) reason = "benchmark spec: critest runs pkg/benchmark specs only when invoked with -benchmark"
+                  else reason = "excluded by upstream --ginkgo.skip in contrib/Dockerfile.test (reasons above)"
+                  printf "CRITEST SKIP | %s | %s\n", spec, reason
+                  total++
+                }
+                inb = 0; rr = ""; next
+              }
+              /^ *\[SKIPPED\] / { r = $0; sub(/^ *\[SKIPPED\] /, "", r); rr = r; next }
+              /^S \[SKIPPED\]/ { inb = 1; spec = ""; rt = ($0 ~ /seconds\]/); next }
+              inb && !/\.go:[0-9]+/ {
+                t = $0; gsub(/^ +| +$/, "", t)
+                if (t != "") spec = (spec == "" ? t : spec " > " t)
+              }
+              END { printf "=== %d critest specs skipped (listed above)\n", total + 0 }
+            '
+          else
+            echo "=== The systemd leg runs the same image, the same critest binary and the same --ginkgo.skip list"
+            echo "=== (contrib/Dockerfile.test.d/cri-in-userns/docker-entrypoint.sh); its entrypoint runs critest at default"
+            echo "=== verbosity, so the cgroupfs leg's per-spec list names the same 18 skipped specs."
+          fi
+
+  # Upstream ci.yml's integration-linux job, reduced to the steps this workflow
+  # does not already cover. It runs on a plain hosted runner, exactly as upstream
+  # does (ubuntu-22.04 / ubuntu-24.04 / ubuntu-24.04-arm) -- only the Windows
+  # (Azure VM) and vagrant/SELinux legs need infrastructure hosted runners lack.
+  #
+  #   - `make root-test` exercises the daemon state directories and, with
+  #     mkfs.erofs installed (new upstream step in v2.2.x), the erofs
+  #     snapshotter tests that otherwise skip.
+  #   - `make cri-integration` drives the container attach/exec I/O path that
+  #     the unit legs barely touch.
+  #
+  # Deliberately NOT copied from upstream's job: the critest step (cri-in-userns
+  # already runs critest on both cgroup drivers), the checkpoint-restore step
+  # (the checkpoint-restore job above runs that same script), the second
+  # TESTFLAGS_PARALLEL=1 integration pass and TESTFLAGS_RACE=-race -- one serial
+  # pass is what this seal needs to verify, the rest is upstream regression
+  # budget. Single leg rather than upstream's 3-OS x 2-cgroup-driver matrix.
+  integration-linux:
+    name: Linux Integration
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    env:
+      TEST_RUNTIME: io.containerd.runc.v2
+      CGROUP_DRIVER: cgroupfs
+      RUNC_FLAVOR: runc
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.11'
+          cache: false
+
+      - name: Install containerd dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y gperf dmsetup strace xfsprogs
+          script/setup/install-seccomp
+          script/setup/install-runc
+          script/setup/install-cni $(grep containernetworking/plugins go.mod | awk '{print $2}')
+          script/setup/install-critools
+          script/setup/install-failpoint-binaries
+
+      - name: Install criu
+        run: |
+          set -euo pipefail
+          sudo add-apt-repository -y ppa:criu/ppa
+          sudo apt-get update
+          sudo apt-get install -y criu
+          criu --version
+
+      # Copied verbatim from upstream v2.2.1 ci.yml integration-linux.
+      # "apt-get install erofs-utils" installs an older version (1.7.1 as of 2025-09-18)
+      # Build and install erofs-utils 1.8.8 from source to get a newer version
+      - name: Build and install erofs-utils from source
+        run: |
+          # Install dependencies
+          sudo apt-get update
+          sudo apt-get install -y wget make gcc libz-dev liblz4-dev libfuse-dev autoconf libtool pkg-config uuid-dev
+
+          # Create temporary build directory
+          BUILD_DIR="$(mktemp -d)"
+          cd "$BUILD_DIR"
+
+          # get erofs-utils-1.8.8.tar.gz
+          wget https://git.kernel.org/pub/scm/linux/kernel/git/xiang/erofs-utils.git/snapshot/erofs-utils-1.8.8.tar.gz
+          tar -xzf erofs-utils-1.8.8.tar.gz
+          cd erofs-utils-1.8.8
+
+          # Build and install erofs-utils
+          ./autogen.sh
+          ./configure --enable-lz4 --enable-fuse --with-uuid
+          make -j"$(nproc)"
+          sudo make install
+          sudo ldconfig
+
+          # Clean up
+          cd -
+          rm -rf "$BUILD_DIR"
+
+          # Verify installation
+          mkfs.erofs --version
+
+      - name: Load EROFS kernel module
+        run: |
+          sudo modprobe erofs
+
+      - name: Install containerd
+        env:
+          CGO_ENABLED: 1
+        run: |
+          set -euo pipefail
+          make binaries GO_BUILD_FLAGS="-mod=vendor"
+          sudo -E PATH=$PATH make install
+
+      # The root unit tests: these create the daemon state directories and run
+      # the erofs snapshotter tests against the mkfs.erofs built above.
+      - name: Root tests
+        run: |
+          set -euo pipefail
+          sudo -E PATH=$PATH make root-test
+
+      - name: Integration
+        run: |
+          set -euo pipefail
+          runc --version
+          sudo -E PATH=$PATH make integration
+
+      - name: CRI integration
+        run: |
+          set -euo pipefail
+          cat /sys/fs/cgroup/cgroup.controllers
+          sudo -E PATH=$PATH CONTAINERD_RUNTIME=$TEST_RUNTIME make cri-integration
+
+      - name: Host status
+        if: always()
+        run: |
+          set -x
+          mount
+          df
+          losetup -l
+
+      - name: Kernel messages
+        if: failure()
+        run: |
+          sudo lsmod
+          sudo dmesg -T -f kern
+
+  test:
+    name: Test on ${{ matrix.os }} (go ${{ matrix.go-version }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # Mirrors upstream ci.yml for v2.2.1: both toolchain lines (1.24, the
+        # go.mod floor line, and 1.25) on every OS, plus the Linux arm64 leg.
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+        go-version: ['1.24.11', '1.25.5']
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 50
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '${{ matrix.go-version }}'
+          cache: false
+
+      - name: Install Linux deps
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libbtrfs-dev libseccomp-dev pkg-config
+
+      # pkg/archive/compression's TestCompressDecompressPigz skips unless
+      # `unpigz` is on PATH. The Linux runner images ship it; macOS and Windows
+      # do not, so install it there and the pigz decompression path is tested
+      # on every OS.
+      - name: Install pigz (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install pigz
+          unpigz --version
+
+      - name: Install pigz (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          CONDA_PLUGINS_AUTO_ACCEPT_TOS: 'yes'
+        run: |
+          & "$env:CONDA\Scripts\conda.exe" create --yes --quiet --prefix "$env:RUNNER_TEMP\pigz" --override-channels -c conda-forge pigz
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "$env:RUNNER_TEMP\pigz\Library\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & "$env:RUNNER_TEMP\pigz\Library\bin\unpigz.exe" --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run tests
+        shell: bash
+        env:
+          GOFLAGS: -mod=vendor
+          TF: ${{ inputs.test-filter }}
+        run: |
+          set -euo pipefail
+          ALL=$(go list ./...)
+          PKGS=$(printf '%s\n' "$ALL" | grep -Ev '/integration|/cmd/|/contrib/|plugins/snapshots/btrfs|plugins/snapshots/devmapper|plugins/snapshots/blockfile|core/snapshots/testsuite|plugins/snapshots/overlay/overlayutils')
+          MANDATORY="github.com/containerd/containerd/v2/client
+          github.com/containerd/containerd/v2/core/images
+          github.com/containerd/containerd/v2/core/mount
+          github.com/containerd/containerd/v2/core/runtime/v2
+          github.com/containerd/containerd/v2/internal/cri/config
+          github.com/containerd/containerd/v2/internal/cri/io
+          github.com/containerd/containerd/v2/internal/cri/labels
+          github.com/containerd/containerd/v2/internal/cri/server
+          github.com/containerd/containerd/v2/internal/cri/util
+          github.com/containerd/containerd/v2/pkg/archive
+          github.com/containerd/containerd/v2/pkg/labels
+          github.com/containerd/containerd/v2/pkg/oci
+          github.com/containerd/containerd/v2/plugins/cri/runtime"
+          while IFS= read -r pkg; do
+            pkg=$(printf '%s' "$pkg" | tr -d '[:space:]')
+            [ -n "$pkg" ] || continue
+            if printf '%s\n' "$ALL" | grep -Fxq "$pkg"; then
+              if ! printf '%s\n' "$PKGS" | grep -Fxq "$pkg"; then
+                echo "ERROR: mandatory-coverage package '$pkg' was filtered out of the test list"
+                exit 1
+              fi
+            fi
+          done <<< "$MANDATORY"
+          echo "Packages under test: $(printf '%s\n' "$PKGS" | wc -l)"
+          RUN=()
+          if [ -n "$TF" ]; then RUN=(-run "$TF"); fi
+          LOG="$RUNNER_TEMP/go-test.log"
+          set +e
+          # No -short: upstream's `make test` does not pass it, and the only
+          # test it gates (TestSourceDateEpoch's repro half) lives in
+          # pkg/archive/tar_test.go, a file the CVE fixes touch.
+          go test -v -timeout 20m ${RUN[@]+"${RUN[@]}"} $PKGS 2>&1 | tee "$LOG"
+          rc=${PIPESTATUS[0]}
+          set -e
+          OK_PKGS=$(awk '/^ok /{c++} END{print c+0}' "$LOG")
+          FAIL_PKGS=$(awk '/^FAIL[[:space:]]/{c++} END{print c+0}' "$LOG")
+          NOTEST_PKGS=$(awk '/^\?[[:space:]]/{c++} END{print c+0}' "$LOG")
+          PASS_TOP=$(awk '/^--- PASS/{c++} END{print c+0}' "$LOG")
+          PASS_ALL=$(awk '/^[[:space:]]*--- PASS/{c++} END{print c+0}' "$LOG")
+          FAIL_ALL=$(awk '/^[[:space:]]*--- FAIL/{c++} END{print c+0}' "$LOG")
+          SKIP_ALL=$(awk '/^[[:space:]]*--- SKIP/{c++} END{print c+0}' "$LOG")
+          echo "=== SUMMARY: packages ok=$OK_PKGS failed=$FAIL_PKGS no-test-files=$NOTEST_PKGS; tests passed=$PASS_TOP (incl. subtests $PASS_ALL) failed=$FAIL_ALL skipped=$SKIP_ALL; go test exit=$rc"
+          if [ "$rc" -ne 0 ]; then
+            exit "$rc"
+          fi
+          if [ "$OK_PKGS" -eq 0 ]; then
+            echo "ERROR: no package reported ok -- no tests ran"
+            exit 1
+          fi
+
+      # go test -v prints a subtest's t.Skip message where it is raised, far
+      # from the parent's "--- SKIP" summary line. Pair them up per package so
+      # every skipped test is listed next to its reason.
+      - name: Report skipped tests and reasons
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          LOG="$RUNNER_TEMP/go-test.log"
+          if [ ! -f "$LOG" ]; then
+            echo "no go test log"
+            exit 0
+          fi
+          echo "=== SKIPPED TESTS: package | test | reason (the t.Skip message the test logged)"
+          awk '
+            { sub(/\r$/, "") }
+            /^=== (RUN|NAME|CONT|PAUSE) / { cur = $3; next }
+            /^[[:space:]]+[A-Za-z0-9_]+\.go:[0-9]+: / {
+              if (cur != "") { line = $0; sub(/^[[:space:]]+/, "", line); msg[cur] = line }
+              next
+            }
+            /^[[:space:]]*--- SKIP: / { n++; name[n] = $3; next }
+            /^(ok|FAIL)[[:space:]]/ {
+              for (i = 1; i <= n; i++) {
+                r = (name[i] in msg) ? msg[name[i]] : "(test gave no skip message)"
+                if (r ~ /^[A-Za-z0-9_]+\.go:[0-9]+: *$/) {
+                  # Bare t.Skip(): show the condition guarding it in the source.
+                  split(r, loc, ":")
+                  dir = $2; sub(/^github\.com\/containerd\/containerd\/v2\/?/, "", dir)
+                  src = (dir == "" ? "" : dir "/") loc[1]; want = loc[2] - 1; ln = 0; guard = ""
+                  while ((getline sl < src) > 0) { ln++; if (ln == want) { guard = sl; break } }
+                  close(src)
+                  sub(/^[[:space:]]+/, "", guard)
+                  r = r "bare t.Skip() guarded by: " guard
+                }
+                printf "SKIP | %s | %s | %s\n", $2, name[i], r
+                total++
+              }
+              n = 0; cur = ""; split("", msg)
+              next
+            }
+            END { printf "=== %d skipped tests listed\n", total + 0 }
+          ' "$LOG"
